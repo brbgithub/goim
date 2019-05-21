@@ -2,7 +2,6 @@ package connect
 
 import (
 	"fmt"
-	"github.com/alberliu/goim/connect"
 	"github.com/brbgithub/goim/public/logger"
 	"net"
 	"runtime"

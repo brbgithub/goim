@@ -1,0 +1,6 @@
+syntax "proto3";
+package pb;
+
+message SyncTrigger {
+    int64 sync_sequence = 2; // 已经同步的序列号
+}
