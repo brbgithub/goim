@@ -1,6 +1,10 @@
 package connect
 
-import "time"
+import (
+	"github.com/brbgithub/goim/public/logger"
+	"net"
+	"time"
+)
 
 const (
 	ReadDeadline  = 10 * time.Minute
@@ -23,4 +27,48 @@ const (
 // ConnContext 连接上下文
 type ConnContext struct {
 	Codec *Codec // 编解码器
+	IsSignIn bool // 是否
+	DeviceId int64 // 设备id
+	UserId int64 // 用户id
+}
+
+// Package 消息包
+type Package struct {
+	Code int // 消息类型
+	Content []byte // 消息体
+}
+
+func NewConnContext(conn *net.TCPConn) *ConnContext {
+	codec := NewCodec(conn)
+	return &ConnContext{Codec:codec}
+}
+
+// DoConn 处理TCP连接
+func (c *ConnContext) DoConn() {
+	defer RecoverPanic()
+
+	c.HandleConnect()
+
+	for {
+		err := c.Codec.Conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+		if err != nil{
+
+		}
+	}
+}
+
+// HandleConnect 建立连接
+func (c *ConnContext) HandleConnect() {
+	logger.Logger.Info("tcp connect")
+}
+
+// Realease 释放TCP连接
+func (c *ConnContext) Realease() {
+	delete(c.DeviceId)
+	err := c.Codec.Conn.Close()
+	if err != nil{
+		logger.Sugar.Error(err)
+	}
+
+
 }
