@@ -1,8 +1,16 @@
 package connect
 
 import (
+	"fmt"
+	"github.com/brbgithub/goim/conf"
+	"github.com/brbgithub/goim/public/lib"
 	"github.com/brbgithub/goim/public/logger"
+	"github.com/brbgithub/goim/public/pb"
+	"github.com/brbgithub/goim/public/transfer"
+	"golang.org/x/protobuf/proto"
+	"io"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -52,7 +60,23 @@ func (c *ConnContext) DoConn() {
 	for {
 		err := c.Codec.Conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 		if err != nil{
+			c.HandleReadErr(err)
+			return
+		}
 
+		_,err = c.Codec.Read()
+		if err != nil {
+			c.HandleReadErr(err)
+			return
+		}
+
+		for {
+			message, ok := c.Codec.Decode()
+			if ok {
+				c.HandlePackage(message)
+				continue
+			}
+			break
 		}
 	}
 }
@@ -60,6 +84,169 @@ func (c *ConnContext) DoConn() {
 // HandleConnect 建立连接
 func (c *ConnContext) HandleConnect() {
 	logger.Logger.Info("tcp connect")
+}
+
+// HandlePackage 处理消息包
+func (c *ConnContext) HandlePackage(pack *Package) {
+	// 未登录拦截
+	if pack.Code != CodeSignIn && c.IsSignIn == false {
+		c.Realease()
+		return
+	}
+
+	switch pack.Code {
+	case CodeSignIn:
+		c.HandlePackageSignIn(pack)
+	case CodeSyncTrigger:
+		c.HandlePackageSyncTrigger(pack)
+	case CodeHeartbeat:
+		c.HandlePackageHeartbeat()
+	case CodeMessageSend:
+		c.HandlePackageMessageSend(pack)
+	case CodeMessageACK:
+		c.HandlePackageMessageACK(pack)
+	}
+	return
+}
+
+func (c *ConnContext) HandlePackageSignIn(pack *Package) {
+	var sign pb.SignIn
+	err := proto.Unmarshal(pack.Content, &sign)
+	if err != nil {
+		logger.Sugar.Error(err)
+		c.Realease()
+		return
+	}
+
+	transferSignIn := transfer.SignIn{
+		DeviceId:sign.DeviceId,
+		UserId:sign.UserId,
+		Token:sign.Token,
+	}
+
+	// 处理设备登录逻辑
+	ack, err := signIn(transferSignIn)
+	if err != nil {
+		logger.Sugar.Error(err)
+		return
+	}
+
+	content,err := proto.Marshal(&pb.SignInACK{Code:int32(ack.Code),Message:ack.Message})
+	if err != nil{
+		logger.Sugar.Error(err)
+		return
+	}
+
+	err = c.Codec.Encode(Package{Code:CodeSignInACK, Content:content},WriteDeadline)
+	if err != nil {
+		logger.Sugar.Error(err)
+		return
+	}
+
+	if ack.Code == transfer.CodeSignInSuccess {
+		// 将连接保存到本机字典
+		c.IsSignIn = true
+		c.DeviceId = sign.DeviceId
+		c.UserId = sign.UserId
+		store(c.DeviceId, c)
+	}
+
+	// 将设备和服务器IP的对应关系保存到redis
+	redisClient.Set(deviceIdPre+fmt.Sprint(c.DeviceId), conf.ConnectTCPListenIP+"."+conf.ConnectTCPListenPort,0)
+}
+
+// HandlePackageSyncTrigger 处理同步触发消息包
+func (c *ConnContext) HandlePackageSyncTrigger(pack *Package) {
+	var trigger pb.SyncTrigger
+	err := proto.Unmarshal(pack.Content,&trigger)
+	if err != nil{
+		logger.Sugar.Error(err)
+		c.Realease()
+		return
+	}
+
+	transferTrigger := transfer.SyncTrigger{
+		DeviceId:c.DeviceId,
+		UserId:c.UserId,
+		SyncSequence:trigger.SyncSequence,
+	}
+
+	publishSyncTrigger(transferTrigger)
+}
+
+// HandlePackageHeadbeat 处理心跳包
+func (c *ConnContext) HandlePackageHeartbeat() {
+	err := c.Codec.Encode(Package{Code:CodeHeartbeatACK,Content:[]byte{}},WriteDeadline)
+	if err != nil{
+		logger.Sugar.Error(err)
+	}
+	logger.Sugar.Infow("心跳：", "device_id", c.DeviceId, "user_id", c.UserId)
+}
+
+// HandlePackageMessageSend 处理消息发送包
+func (c *ConnContext) HandlePackageMessageSend(pack *Package) {
+	var send pb.MessageSend
+	err := proto.Unmarshal(pack.Content, &send)
+	if err != nil {
+		logger.Sugar.Error(err)
+		c.Realease()
+		return
+	}
+
+	transferSend := transfer.MessageSend{
+		SenderDeviceId:c.DeviceId,
+		SenderUserId:c.UserId,
+		ReceiverType:send.ReceiverType,
+		ReceiverId:send.ReceiverId,
+		Type:send.Type,
+		Content:send.Content,
+		SendSequence:send.SendSequence,
+		SendTime:lib.UnunixTime(send.SendTime),
+	}
+
+	publishMessageSend(transferSend)
+}
+
+// HandlePackageMessageACK 处理消息回执消息包
+func (c *ConnContext) HandlePackageMessageACK(pack *Package) {
+	var ack pb.MessageACK
+	err := proto.Unmarshal(pack.Content,&ack)
+	if err != nil{
+		logger.Sugar.Error(err)
+		c.Realease()
+		return
+	}
+
+	transferAck := transfer.MessageACK{
+		MessageId:ack.MessageId,
+		DeviceId:c.DeviceId,
+		UserId:c.UserId,
+		SyncSequence:ack.SyncSequence,
+		ReceiveTime:lib.UnunixTime(ack.ReceiveTime),
+	}
+
+	publishMessageACK(transferAck)
+}
+
+// HandleReadErr 读取conn错误
+func (c *ConnContext) HandleReadErr(err error) {
+	logger.Sugar.Infow("连接读取异常：","device_id",c.DeviceId,"user_id",c.UserId,"err_msg",err)
+	str := err.Error()
+	// 服务器主动关闭连接
+	if strings.HasSuffix(str, "use of closed network connection") {
+		return
+	}
+
+	c.Realease()
+	// 客户端主动关闭连接或者异常程序退出
+	if err == io.EOF {
+		return
+	}
+	// SetReadDeadline 之后，超时返回的错误
+	if strings.HasSuffix(str, "i/o timeout") {
+		return
+	}
+	logger.Sugar.Infow("连接读取未知异常：", "device_id", c.DeviceId, "user_id", c.UserId, "err_msg", err)
 }
 
 // Realease 释放TCP连接
@@ -70,5 +257,8 @@ func (c *ConnContext) Realease() {
 		logger.Sugar.Error(err)
 	}
 
-
+	publishOffLine(transfer.OffLine{
+		DeviceId:c.DeviceId,
+		UserId:c.UserId,
+	})
 }
