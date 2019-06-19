@@ -19,6 +19,14 @@ func NewLError(code int,message string) *LError {
 	}
 }
 
+func WrapLErrorWithData(err *LError, data interface{}) *LError {
+	return &LError{
+		Code:    err.Code,
+		Message: err.Message,
+		Data:    data,
+	}
+}
+
 // 通用错误
 var (
 	LErrUnauthorized      = NewLError(1, "unauthorized")         // 需要认证
